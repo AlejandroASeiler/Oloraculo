@@ -1056,6 +1056,143 @@ public class CoreTests
     }
 
     [Fact]
+    public async Task SnapshotService_SavesFullFixtureAsParentBatchAndMatchChildren()
+    {
+        await using var db = await NewDb();
+        var service = new SnapshotService(db);
+        var first = Prediction(4, "Final", .6, .2, .2);
+        var second = Prediction(4, "Final", .2, .3, .5);
+        first.FixtureId = "f1";
+        second.FixtureId = "f2";
+
+        var batch = await service.SaveFullFixtureAsync([first, second]);
+
+        Assert.Equal("full-fixture", batch.Kind);
+        Assert.Null(batch.BatchId);
+        var children = await db.Snapshots
+            .Where(snapshot => snapshot.Kind == "match" && snapshot.BatchId == batch.Id)
+            .OrderBy(snapshot => snapshot.FixtureId)
+            .ToListAsync();
+        Assert.Equal(["f1", "f2"], children.Select(snapshot => snapshot.FixtureId));
+        Assert.Equal(1, await db.Snapshots.CountAsync(snapshot => snapshot.Kind == "full-fixture"));
+        Assert.Equal(2, await db.Snapshots.CountAsync(snapshot => snapshot.Kind == "match"));
+    }
+
+    [Fact]
+    public async Task SnapshotService_LoadsFullFixtureBatchAsPredictionResults()
+    {
+        await using var db = await NewDb();
+        db.Teams.AddRange(
+            new Team { Id = "a", Name = "Alpha" },
+            new Team { Id = "b", Name = "Beta" },
+            new Team { Id = "c", Name = "Gamma" },
+            new Team { Id = "d", Name = "Delta" });
+        db.Fixtures.AddRange(
+            new Fixture { Id = "f1", Group = "A", HomeTeamId = "a", AwayTeamId = "b" },
+            new Fixture { Id = "f2", Group = "A", HomeTeamId = "c", AwayTeamId = "d" });
+        await db.SaveChangesAsync();
+        var first = Prediction(4, "Final", .6, .2, .2);
+        var second = Prediction(4, "Final", .2, .3, .5);
+        first.FixtureId = "f1";
+        first.HomeTeamId = "a";
+        first.AwayTeamId = "b";
+        first.ExpectedHomeGoals = 1.4;
+        first.ExpectedAwayGoals = .9;
+        first.MostLikelyScore = (1, 0);
+        second.FixtureId = "f2";
+        second.HomeTeamId = "c";
+        second.AwayTeamId = "d";
+        var service = new SnapshotService(db);
+        var batch = await service.SaveFullFixtureAsync([first, second]);
+
+        var result = await service.LoadFullFixtureSnapshotAsync(batch.Id);
+
+        Assert.True(result.IsValid);
+        Assert.Equal(["f1", "f2"], result.Predictions.Select(prediction => prediction.Fixture.Id));
+        Assert.Equal("Alpha", result.Predictions[0].HomeTeamName);
+        AssertPredictionEqual(first, result.Predictions[0].BestPrediction);
+        AssertPredictionEqual(second, result.Predictions[1].BestPrediction);
+    }
+
+    [Fact]
+    public async Task SnapshotService_ListsMatchSnapshotsNewestFirstAndLoadsLatest()
+    {
+        await using var db = await NewDb();
+        db.Teams.AddRange(new Team { Id = "a", Name = "A" }, new Team { Id = "b", Name = "B" });
+        db.Fixtures.Add(new Fixture { Id = "f1", Group = "A", HomeTeamId = "a", AwayTeamId = "b" });
+        await db.SaveChangesAsync();
+        var oldPrediction = Prediction(4, "Old", .6, .2, .2);
+        var newPrediction = Prediction(4, "New", .2, .3, .5);
+        oldPrediction.FixtureId = "f1";
+        newPrediction.FixtureId = "f1";
+        var service = new SnapshotService(db);
+        var oldSnapshot = await service.SaveMatchAsync(oldPrediction);
+        var newSnapshot = await service.SaveMatchAsync(newPrediction);
+
+        var summaries = await service.MatchSnapshotsAsync("f1");
+        var latest = await service.LoadLatestMatchSnapshotAsync("f1");
+
+        Assert.Equal([newSnapshot.Id, oldSnapshot.Id], summaries.Select(summary => summary.Id));
+        Assert.True(latest.IsValid);
+        AssertPredictionEqual(newPrediction, latest.Prediction!.BestPrediction);
+    }
+
+    [Fact]
+    public async Task SnapshotService_LoadsLegacyMatchSnapshotFromColumnsAndCurrentFixture()
+    {
+        await using var db = await NewDb();
+        db.Teams.AddRange(new Team { Id = "a", Name = "A" }, new Team { Id = "b", Name = "B" });
+        db.Fixtures.Add(new Fixture { Id = "f1", Group = "A", HomeTeamId = "a", AwayTeamId = "b" });
+        db.Snapshots.Add(new PredictionSnapshot
+        {
+            Kind = "match",
+            FixtureId = "f1",
+            ModelName = "Legacy",
+            InputSummaryHash = "legacy",
+            PayloadJson = "{}",
+            Explanation = "legacy prediction",
+            HomeWin = .6,
+            Draw = .2,
+            AwayWin = .2
+        });
+        await db.SaveChangesAsync();
+        var service = new SnapshotService(db);
+
+        var loaded = await service.LoadLatestMatchSnapshotAsync("f1");
+
+        Assert.True(loaded.IsValid);
+        Assert.Equal("Legacy", loaded.Prediction!.BestPrediction.PredictorName);
+        Assert.Equal("a", loaded.Prediction.BestPrediction.HomeTeamId);
+        Assert.Equal(.6, loaded.Prediction.BestPrediction.Outcome.HomeWin);
+    }
+
+    [Fact]
+    public async Task SnapshotService_SurfacesMalformedFullFixtureSnapshots()
+    {
+        await using var db = await NewDb();
+        db.Snapshots.Add(new PredictionSnapshot
+        {
+            Kind = "full-fixture",
+            ModelName = "Final",
+            InputSummaryHash = "bad-fixture",
+            PayloadJson = "not json",
+            Explanation = "bad",
+            HomeWin = 0,
+            Draw = 0,
+            AwayWin = 0
+        });
+        await db.SaveChangesAsync();
+        var service = new SnapshotService(db);
+
+        var summaries = await service.FullFixtureSnapshotsAsync();
+        var loaded = await service.LoadFullFixtureSnapshotAsync(summaries.Single().Id);
+
+        Assert.False(summaries.Single().IsValid);
+        Assert.False(loaded.IsValid);
+        Assert.False(string.IsNullOrWhiteSpace(loaded.Error));
+    }
+
+    [Fact]
     public async Task SnapshotService_ListsTournamentSnapshotsNewestFirstAndExcludesMatches()
     {
         await using var db = await NewDb();
